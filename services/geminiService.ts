@@ -1,90 +1,113 @@
+import { GoogleGenAI, Type } from "@google/genai";
 import type { Source, DisambiguationChoice } from '../types';
+
+if (!process.env.API_KEY) {
+    throw new Error("API_KEY environment variable is not set.");
+}
+
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+const disambiguationSchema = {
+    type: Type.ARRAY,
+    items: {
+        type: Type.OBJECT,
+        properties: {
+            topic: {
+                type: Type.STRING,
+                description: 'A more specific search term for one of the meanings, in Farsi.'
+            },
+            description: {
+                type: Type.STRING,
+                description: 'A short description of the topic in Farsi.'
+            }
+        },
+        required: ['topic', 'description']
+    }
+};
+
+
+export async function getDisambiguation(query: string): Promise<DisambiguationChoice[]> {
+    try {
+        const prompt = `کاربر عبارت "${query}" را جستجو کرده است. این عبارت ممکن است مبهم باشد. اگر چندین معنی رایج و مشخص دارد، لیستی از حداکثر 5 معنی را ارائه بده. برای هر معنی، یک 'topic' (که یک عبارت جستجوی دقیق‌تر به فارسی است) و یک 'description' (توضیحی مختصر به فارسی) ارائه کن. اگر عبارت مبهم نیست یا یک معنی اصلی و واضح دارد، یک لیست خالی برگردان. خروجی باید با فرمت JSON باشد.`;
+
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt,
+            config: {
+                responseMimeType: "application/json",
+                responseSchema: disambiguationSchema,
+            },
+        });
+
+        const jsonString = response.text.trim();
+        if (!jsonString) {
+            return [];
+        }
+
+        const choices = JSON.parse(jsonString);
+        
+        if (Array.isArray(choices)) {
+            return choices;
+        }
+
+        return [];
+
+    } catch (error) {
+        console.error("Error in getDisambiguation, proceeding as if unambiguous:", error);
+        // Gracefully fail by returning an empty array, allowing the app to proceed.
+        return [];
+    }
+}
+
 
 export interface StreamEvent {
     type: 'content' | 'sources';
     payload: any;
 }
 
-// This function now calls our secure backend endpoint for disambiguation.
-export async function getDisambiguation(query: string): Promise<DisambiguationChoice[]> {
+export async function* fetchArticleStream(query: string): AsyncGenerator<StreamEvent> {
     try {
-        const response = await fetch('/api/generate', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
+        const prompt = `شما یک دانشنامه جامع و چندزبانه هستید. لطفاً یک مقاله مفصل و دقیق به زبان فارسی در مورد موضوع زیر بنویسید: "${query}". در متن مقاله، کلمات و مفاهیم کلیدی و مهمی که کاربر ممکن است بخواهد در مورد آنها بیشتر بداند را با قرار دادن در دو براکت مشخص کنید، به این صورت: [[مفهوم کلیدی]]. لطفاً اطلاعات را از منابع معتبر تهیه کنید و ساختار مقاله شبیه به یک مقاله ویکی‌پدیا باشد.`;
+
+        const stream = await ai.models.generateContentStream({
+            model: "gemini-2.5-flash",
+            contents: prompt,
+            config: {
+                tools: [{ googleSearch: {} }],
+                thinkingConfig: { thinkingBudget: 0 }
             },
-            body: JSON.stringify({ operation: 'disambiguate', query }),
         });
 
-        if (!response.ok) {
-            const errorBody = await response.json();
-            throw new Error(errorBody.error || 'Failed to get disambiguation choices.');
-        }
+        const allSources: Source[] = [];
 
-        const choices = await response.json();
-        
-        if (Array.isArray(choices) && choices.length > 1) {
-            return choices;
-        }
-        return [];
-
-    } catch (error) {
-        console.error("Error in getDisambiguation, proceeding as if unambiguous:", error);
-        // Gracefully fail by returning an empty array.
-        return [];
-    }
-}
-
-
-// This async generator now fetches the streaming response from our secure backend.
-export async function* fetchArticleStream(query: string): AsyncGenerator<StreamEvent> {
-    const response = await fetch('/api/generate', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ operation: 'streamArticle', query }),
-    });
-
-    if (!response.ok || !response.body) {
-        const errorBody = await response.json();
-        throw new Error(errorBody.error || "Failed to fetch article stream.");
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-
-    try {
-        let buffer = '';
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            buffer += decoder.decode(value, { stream: true });
+        for await (const chunk of stream) {
+            const contentPart = chunk.text;
+            if (contentPart) {
+                yield { type: 'content', payload: contentPart };
+            }
             
-            // Process buffer line by line for Server-Sent Events (SSE)
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || ''; // Keep the last, possibly incomplete, line
-
-            for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    const jsonString = line.substring(6);
-                    try {
-                        const eventData = JSON.parse(jsonString);
-                        yield eventData as StreamEvent;
-                    } catch (e) {
-                        console.error("Failed to parse stream event:", jsonString);
-                    }
-                }
+            const rawSourcesInChunk = chunk.candidates?.[0]?.groundingMetadata?.groundingChunks;
+            if (rawSourcesInChunk && rawSourcesInChunk.length > 0) {
+                 const newSources: Source[] = rawSourcesInChunk
+                    .map((s: any) => ({
+                        uri: s.web?.uri || '',
+                        title: s.web?.title || 'منبع نامشخص'
+                    }))
+                    .filter((source: Source) => source.uri);
+                allSources.push(...newSources);
             }
         }
+        
+        if (allSources.length > 0) {
+            const uniqueSources = Array.from(new Map(allSources.map(s => [s.uri, s])).values());
+            yield { type: 'sources', payload: uniqueSources };
+        }
+
     } catch (error) {
-         console.error("Error reading from article stream:", error);
-         if (error instanceof Error) {
-            throw new Error(`خطا در ارتباط با سرور: ${error.message}`);
-         }
-         throw new Error("یک خطای ناشناخته در هنگام دریافت مقاله رخ داد.");
-    } finally {
-        reader.releaseLock();
+        console.error("Error fetching article from Gemini API:", error);
+        if (error instanceof Error) {
+            throw new Error(`خطا در ارتباط با سرویس هوش مصنوعی: ${error.message}`);
+        }
+        throw new Error("یک خطای ناشناخته در هنگام دریافت مقاله رخ داد.");
     }
-}
+};

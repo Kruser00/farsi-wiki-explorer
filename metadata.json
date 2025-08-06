@@ -1,5 +1,6 @@
 {
   "name": "Farsi Wiki Explorer",
   "description": "An application that uses AI to generate Wikipedia-style articles in Farsi on any topic, providing sourced information.",
-  "requestFramePermissions": []
+  "requestFramePermissions": [],
+  "prompt": ""
 }
